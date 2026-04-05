@@ -38,15 +38,11 @@ export default function EssayFeedbackPage() {
   }, [router]);
 
   const handleEssaySubmit = async (essay: string, prompt: string) => {
-    console.log('User object:', user);
-    console.log('User ID:', user?.id);
-    
     setIsLoading(true);
     setError(null);
     setFeedback(null);
 
     try {
-      console.log('Sending to API:', { essay: essay.substring(0, 50), prompt: prompt.substring(0, 50) });
       const response = await fetch('/api/submit-essay', {
         method: 'POST',
         headers: {
@@ -58,15 +54,12 @@ export default function EssayFeedbackPage() {
         }),
       });
 
-      console.log('API response status:', response.status);
-
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.error || 'Failed to get feedback');
       }
 
       const data: FeedbackResponse = await response.json();
-      console.log('API response data:', data);
       setFeedback(data);
       
       // Scroll to results

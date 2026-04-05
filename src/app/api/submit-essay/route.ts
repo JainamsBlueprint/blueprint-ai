@@ -27,6 +27,21 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // ~8000 chars ≈ 1500-2000 words, well above the stated 1000-word limit
+    if (essay.length > 8000) {
+      return NextResponse.json(
+        { error: 'Essay exceeds maximum length of 8000 characters.' },
+        { status: 400 }
+      );
+    }
+
+    if (prompt.length > 2000) {
+      return NextResponse.json(
+        { error: 'Prompt exceeds maximum length of 2000 characters.' },
+        { status: 400 }
+      );
+    }
+
     // Create an authenticated Supabase server client using cookies
     const cookieStore = await cookies();
     const supabase = createServerClient(
@@ -67,51 +82,59 @@ export async function POST(request: NextRequest) {
     let userRecord: DbUser | null = null;
     let essaysUsed = 0;
 
-    if (user) {
-      const { data: userData, error: userError } = await supabase
+    // Ensure user record exists
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', user.id)
+      .single();
+
+    if (userError && userError.code !== 'PGRST116') {
+      console.error('Error fetching user record:', userError);
+    }
+
+    if (!userData) {
+      const { data: newUser, error: insertUserError } = await supabase
         .from('users')
-        .select('*')
-        .eq('id', user.id)
+        .insert([
+          {
+            id: user.id,
+            email: user.email!,
+            essays_used_this_month: 0,
+            subscription_status: 'free',
+          },
+        ])
+        .select()
         .single();
 
-      if (userError && userError.code !== 'PGRST116') {
-        console.error('Error fetching user record:', userError);
+      if (insertUserError) {
+        console.error('Error creating user record:', insertUserError);
+      } else if (newUser) {
+        userRecord = newUser;
       }
-
-      if (!userData) {
-        // Create a user record on-demand if it doesn't exist
-        const { data: newUser, error: insertUserError } = await supabase
-          .from('users')
-          .insert([
-            {
-              id: user.id,
-              email: user.email!,
-              essays_used_this_month: 0,
-              subscription_status: 'free',
-            },
-          ])
-          .select()
-          .single();
-
-        if (insertUserError) {
-          console.error('Error creating user record:', insertUserError);
-        } else if (newUser) {
-          userRecord = newUser;
-        }
-      } else {
-        userRecord = userData;
-      }
-
-      essaysUsed = userRecord?.essays_used_this_month || 0;
-
-      // Check if free user has exceeded limit
-      if (userRecord?.subscription_status === 'free' && essaysUsed >= 3) {
-        return NextResponse.json(
-          { error: 'Free plan limit reached. Please upgrade to premium for unlimited essays.' },
-          { status: 403 }
-        );
-      }
+    } else {
+      userRecord = userData;
     }
+
+    // Atomically check the limit and increment the counter in one DB operation.
+    // This prevents the race condition where concurrent requests all read the same
+    // count before any of them write, bypassing the 3-essay limit.
+    const { data: creditResult, error: creditError } = await supabase
+      .rpc('use_essay_credit', { p_user_id: user.id });
+
+    if (creditError) {
+      console.error('Error checking essay credit:', creditError);
+      return NextResponse.json({ error: 'Failed to verify usage limit.' }, { status: 500 });
+    }
+
+    if (!creditResult?.allowed) {
+      return NextResponse.json(
+        { error: 'Free plan limit reached. Please upgrade to premium for unlimited essays.' },
+        { status: 403 }
+      );
+    }
+
+    essaysUsed = creditResult.count;
 
     // Create the feedback prompt
     const feedbackPrompt = `You are an expert college admissions counselor and essay reviewer. Please provide detailed, constructive feedback on this college essay.
@@ -196,25 +219,13 @@ Keep feedback constructive, specific, and encouraging. Focus on helping the stud
           console.error('Database save error (essays insert):', insertError);
         }
 
-        // Update user's essay usage count
-        const newCount = essaysUsed + 1;
-        const { error: updateError } = await supabase
-          .from('users')
-          .update({ 
-            essays_used_this_month: newCount
-          })
-          .eq('id', user.id);
-        if (updateError) {
-          console.error('Database save error (users update):', updateError);
-        }
-
-        essaysUsed = newCount;
+        // Count was already atomically incremented by use_essay_credit RPC above
       } catch (dbError) {
         console.error('Database save error:', dbError);
       }
     }
 
-    // Calculate remaining essays
+    // Calculate remaining essays (essaysUsed is already the post-increment count from the RPC)
     let essaysRemaining;
     if (userRecord) {
       if (userRecord.subscription_status === 'premium') {
